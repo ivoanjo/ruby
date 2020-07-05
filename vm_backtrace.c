@@ -103,6 +103,9 @@ typedef struct rb_backtrace_location_struct {
 	    struct rb_backtrace_location_struct *prev_loc;
 	} cfunc;
     } body;
+
+    VALUE defined_class;
+    VALUE instance_class;
 } rb_backtrace_location_t;
 
 struct valued_frame_info {
@@ -234,6 +237,44 @@ static VALUE
 location_label_m(VALUE self)
 {
     return location_label(location_ptr(self));
+}
+
+/*
+ * Returns the class of the instance on which a given method was being called.
+ *
+ * class A
+ *   def foo
+ *     puts caller_locations(0).first.instance_class
+ *   end
+ * end
+ *
+ * class B < A; end
+ *
+ * The result of B.new.foo is B
+ */
+static VALUE
+instance_class_m(VALUE self)
+{
+    return location_ptr(self)->instance_class;
+}
+
+/*
+ * Returns the class on which a given method was defined.
+ *
+ * class A
+ *   def foo
+ *     puts caller_locations(0).first.instance_class
+ *   end
+ * end
+ *
+ * class B < A; end
+ *
+ * The result of B.new.foo is A
+ */
+static VALUE
+defined_class_m(VALUE self)
+{
+    return location_ptr(self)->defined_class;
 }
 
 static VALUE
@@ -540,6 +581,11 @@ bt_iter_iseq(void *ptr, const rb_control_frame_t *cfp)
     loc->type = LOCATION_TYPE_ISEQ;
     loc->body.iseq.iseq = iseq;
     loc->body.iseq.lineno.pc = pc;
+
+    const rb_callable_method_entry_t *cme = rb_vm_frame_method_entry(cfp);
+    loc->defined_class = cme ? cme->defined_class : Qnil;
+    loc->instance_class = rb_obj_class(cfp->self);
+
     arg->prev_loc = loc;
 }
 
@@ -551,6 +597,10 @@ bt_iter_cfunc(void *ptr, const rb_control_frame_t *cfp, ID mid)
     loc->type = LOCATION_TYPE_CFUNC;
     loc->body.cfunc.mid = mid;
     loc->body.cfunc.prev_loc = arg->prev_loc;
+
+    const rb_callable_method_entry_t *cme = rb_vm_frame_method_entry(cfp);
+    loc->defined_class = cme ? cme->defined_class : Qnil;
+    loc->instance_class = rb_obj_class(cfp->self);
 }
 
 MJIT_FUNC_EXPORTED VALUE
@@ -1107,6 +1157,8 @@ Init_vm_backtrace(void)
     rb_define_method(rb_cBacktraceLocation, "absolute_path", location_absolute_path_m, 0);
     rb_define_method(rb_cBacktraceLocation, "to_s", location_to_str_m, 0);
     rb_define_method(rb_cBacktraceLocation, "inspect", location_inspect_m, 0);
+    rb_define_method(rb_cBacktraceLocation, "defined_class", defined_class_m, 0);
+    rb_define_method(rb_cBacktraceLocation, "instance_class", instance_class_m, 0);
 
     rb_define_global_function("caller", rb_f_caller, -1);
     rb_define_global_function("caller_locations", rb_f_caller_locations, -1);
