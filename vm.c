@@ -40,6 +40,44 @@
 #include "ruby/st.h"
 #include "ruby/vm.h"
 #include "vm_core.h"
+#include "hrtime.h" // TEMPORARY REPRO INSTRUMENTATION (not for merging)
+
+// TEMPORARY REPRO INSTRUMENTATION (not for merging): widen a race window in
+// vm_make_env_each for dd-trace-rb profiler crash reproduction purposes.
+//
+// Gated on recursion depth: ordinary framework/gem code (Bundler, RubyGems, etc.)
+// only ever escapes shallow (1-3 level) closure chains, so left ungated this delay
+// would tax *every* proc/thread/binding created anywhere in the process -- including
+// during interpreter/gem startup -- turning simple `ruby -e ...` invocations into a
+// multi-minute hang. Our repro script deliberately builds a much deeper chain
+// (dozens of nested blocks) specifically so it alone crosses this threshold.
+static __thread int ddtrace_repro_depth = 0;
+// TEMPORARY REPRO INSTRUMENTATION (not for merging): only the level whose PARENT is the
+// base/local frame is actually dangerous -- that parent's SPECVAL is genuinely 0
+// (VM_BLOCK_HANDLER_NONE, since no block was passed), so a stale reader landing there reads
+// SPECVAL as a "prev ep" and gets exactly NULL. Every OTHER level's parent has a real,
+// valid (non-NULL) heap pointer in its SPECVAL, so walking through it can never produce
+// NULL no matter how long we delay. With NEST_DEPTH=20, the base is at depth 21, so the
+// one dangerous level is depth 20. Narrowing the gate to just that (plus one level of
+// margin) concentrates all our sampling odds on the transition that can actually crash,
+// instead of diluting it across 10 harmless levels.
+#define DDTRACE_REPRO_DEPTH_THRESHOLD 19
+
+// TEMPORARY REPRO INSTRUMENTATION (not for merging): non-static so the dd-trace-rb native
+// extension (a separately-compiled, dynamically-loaded .so) can `extern` this and check, from
+// inside its own sampling code, whether the sampler's stack walk ever actually visits the
+// exact frame we're tracking during our widened race window.
+__attribute__((visibility("default")))
+volatile const VALUE *ddtrace_repro_tracked_ep = NULL;
+
+static void ddtrace_repro_widen_race_window(void) {
+    if (ddtrace_repro_depth < DDTRACE_REPRO_DEPTH_THRESHOLD) return;
+
+    rb_hrtime_t start = rb_hrtime_now();
+    while (rb_hrtime_now() - start < 100 * RB_HRTIME_PER_MSEC) {
+        // busy spin, deliberately not yielding the GVL
+    }
+}
 #include "vm_callinfo.h"
 #include "vm_debug.h"
 #include "vm_exec.h"
@@ -1084,6 +1122,8 @@ vm_make_env_each(const rb_execution_context_t * const ec, rb_control_frame_t *co
         return VM_ENV_ENVVAL(ep);
     }
 
+    ddtrace_repro_depth++; // TEMPORARY REPRO INSTRUMENTATION (not for merging)
+
     if (!VM_ENV_LOCAL_P(ep)) {
         const VALUE *prev_ep = VM_ENV_PREV_EP(ep);
         if (!VM_ENV_ESCAPED_P(prev_ep)) {
@@ -1095,12 +1135,49 @@ vm_make_env_each(const rb_execution_context_t * const ec, rb_control_frame_t *co
             }
 
             vm_make_env_each(ec, prev_cfp);
+
+            // TEMPORARY REPRO INSTRUMENTATION (not for merging): directly verify our
+            // hypothesized precondition, rather than inferring it indirectly from whether
+            // the profiler's sampler happens to observe it. `prev_ep` is the OLD (now
+            // possibly-abandoned) stack address of the frame we just finished converting.
+            // A CHILD frame elsewhere in the chain may still hold a stale pointer to this
+            // exact address in ITS OWN (not-yet-fixed-up) SPECVAL slot. If a reader walked
+            // in via that stale pointer right now, this is exactly what it would see.
+            if (ddtrace_repro_depth >= DDTRACE_REPRO_DEPTH_THRESHOLD) {
+                VALUE stale_flags = prev_ep[VM_ENV_DATA_INDEX_FLAGS];
+                int stale_reads_as_local = (stale_flags & VM_ENV_FLAG_LOCAL) ? 1 : 0;
+                VALUE stale_specval = prev_ep[VM_ENV_DATA_INDEX_SPECVAL];
+                const VALUE *stale_prev_ep_if_walked = GC_GUARDED_PTR_REF(stale_specval);
+                fprintf(stderr,
+                    "[ddtrace repro] depth=%d post-recursion check on prev_ep=%p: "
+                    "stale_flags=0x%lx (FIXNUM_P=%d) stale_reads_as_local=%d "
+                    "stale_specval=0x%lx stale_prev_ep_if_walked=%p (NULL=%d)\n",
+                    ddtrace_repro_depth, (void *) prev_ep,
+                    (unsigned long) stale_flags, (int) (stale_flags & 1), stale_reads_as_local,
+                    (unsigned long) stale_specval, (void *) stale_prev_ep_if_walked,
+                    stale_prev_ep_if_walked == NULL);
+            }
+
+            // TEMPORARY REPRO INSTRUMENTATION (not for merging): track `cfp->ep` (THIS frame's
+            // own, still-stack-resident address) for the duration of the delay -- this is
+            // exactly the address the sampler's outer per-frame loop would use as its
+            // starting point if it walks into this frame while we're paused here.
+            if (ddtrace_repro_depth >= DDTRACE_REPRO_DEPTH_THRESHOLD) {
+                ddtrace_repro_tracked_ep = ep;
+            }
+            ddtrace_repro_widen_race_window(); // TEMPORARY REPRO INSTRUMENTATION (not for merging)
+            ddtrace_repro_tracked_ep = NULL; // TEMPORARY REPRO INSTRUMENTATION (not for merging)
             VM_FORCE_WRITE_SPECIAL_CONST(&ep[VM_ENV_DATA_INDEX_SPECVAL], VM_GUARDED_PREV_EP(prev_cfp->ep));
         }
     }
     else {
         VM_ASSERT(VM_ENV_LOCAL_P(ep));
         VALUE block_handler = VM_ENV_BLOCK_HANDLER(ep);
+
+        if (ddtrace_repro_depth >= DDTRACE_REPRO_DEPTH_THRESHOLD) { // TEMPORARY REPRO INSTRUMENTATION (not for merging)
+            fprintf(stderr, "[ddtrace repro] depth=%d LOCAL base frame ep=%p block_handler=0x%lx (NONE=%d)\n",
+                ddtrace_repro_depth, (void *) ep, (unsigned long) block_handler, block_handler == VM_BLOCK_HANDLER_NONE);
+        }
 
         if (block_handler != VM_BLOCK_HANDLER_NONE) {
             VALUE blockprocval = vm_block_handler_escape(ec, block_handler);
@@ -1160,6 +1237,7 @@ vm_make_env_each(const rb_execution_context_t * const ec, rb_control_frame_t *co
     env->env = env_body;
     env->env_size = env_size;
 
+    ddtrace_repro_widen_race_window(); // TEMPORARY REPRO INSTRUMENTATION (not for merging)
     cfp->ep = env_ep;
     VM_ENV_FLAGS_SET(env_ep, VM_ENV_FLAG_ESCAPED | VM_ENV_FLAG_WB_REQUIRED);
     VM_STACK_ENV_WRITE(ep, 0, (VALUE)env);		/* GC mark */
@@ -1173,6 +1251,7 @@ vm_make_env_each(const rb_execution_context_t * const ec, rb_control_frame_t *co
     }
 #endif
 
+    ddtrace_repro_depth--; // TEMPORARY REPRO INSTRUMENTATION (not for merging)
     return (VALUE)env;
 }
 
